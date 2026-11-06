@@ -16,7 +16,10 @@ package main
 
 import (
 	"crypto/tls"
+	"crypto/x509"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -66,7 +69,8 @@ func TestParseTLSCipherSuites(t *testing.T) {
 		{"single valid cipher", "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256", 1, false},
 		{"multiple valid ciphers", "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384", 2, false},
 		{"whitespace trimmed", " TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256 , TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384 ", 2, false},
-		{"insecure cipher accepted", "TLS_RSA_WITH_RC4_128_SHA", 1, false},
+		{"3DES cipher accepted", "TLS_RSA_WITH_3DES_EDE_CBC_SHA", 1, false},
+		{"RC4 cipher rejected", "TLS_RSA_WITH_RC4_128_SHA", 0, true},
 		{"unknown cipher is error", "BOGUS_CIPHER", 0, true},
 		{"mixed valid and invalid is error", "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,BOGUS", 0, true},
 		{"only commas is error", ",,", 0, true},
@@ -131,9 +135,23 @@ func TestBuildTLSConfig(t *testing.T) {
 			wantCiphers:    2,
 		},
 		{
-			name:         "TLS 1.2 with insecure cipher only is error (cannot serve HTTP/2)",
+			name:         "TLS 1.2 mixed with RC4 is error",
 			minVersion:   "VersionTLS12",
-			cipherSuites: "TLS_RSA_WITH_RC4_128_SHA",
+			cipherSuites: "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,TLS_RSA_WITH_RC4_128_SHA",
+			wantErr:      true,
+			errContains:  "RC4 cipher suite",
+		},
+		{
+			name:         "TLS 1.2 mixed with TLS 1.3-only suite is error",
+			minVersion:   "VersionTLS12",
+			cipherSuites: "TLS_AES_256_GCM_SHA384,TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+			wantErr:      true,
+			errContains:  "TLS 1.3-only cipher suite",
+		},
+		{
+			name:         "TLS 1.2 with 3DES only is error (cannot serve HTTP/2)",
+			minVersion:   "VersionTLS12",
+			cipherSuites: "TLS_RSA_WITH_3DES_EDE_CBC_SHA",
 			wantErr:      true,
 			errContains:  "cannot serve HTTP/2",
 		},
@@ -316,5 +334,84 @@ func TestInitCertsWithoutCertsStillValidatesTLSFlags(t *testing.T) {
 	}
 	if cfg != nil {
 		t.Fatalf("initCerts() = %v, want nil with no certificates", cfg)
+	}
+}
+
+func TestValidateTLSConfigCertificate(t *testing.T) {
+	tests := []struct {
+		name        string
+		keyType     x509.PublicKeyAlgorithm
+		cipherSuite uint16
+		wantErr     bool
+	}{
+		{"RSA certificate with RSA HTTP/2 suite", x509.RSA, tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256, false},
+		{"RSA certificate with ECDSA HTTP/2 suite", x509.RSA, tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, true},
+		{"ECDSA certificate with ECDSA HTTP/2 suite", x509.ECDSA, tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, false},
+		{"ECDSA certificate with RSA HTTP/2 suite", x509.ECDSA, tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateTLSConfigCertificate(
+				&tls.Config{CipherSuites: []uint16{tt.cipherSuite}},
+				tls.Certificate{Leaf: &x509.Certificate{PublicKeyAlgorithm: tt.keyType}},
+				"test listener",
+			)
+			if tt.wantErr && err == nil {
+				t.Fatal("validateTLSConfigCertificate() expected an error, got nil")
+			}
+			if !tt.wantErr && err != nil {
+				t.Fatalf("validateTLSConfigCertificate() unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+func TestInitCertsRejectsCipherSuiteIncompatibleWithAPICertificate(t *testing.T) {
+	origCert, origKey := tlsCertPath, tlsCertKeyPath
+	origMin, origCiphers := tlsMinVersion, tlsCipherSuites
+	t.Cleanup(func() {
+		tlsCertPath, tlsCertKeyPath = origCert, origKey
+		tlsMinVersion, tlsCipherSuites = origMin, origCiphers
+	})
+
+	tempDir := t.TempDir()
+	certPath, keyPath := filepath.Join(tempDir, "cert.pem"), filepath.Join(tempDir, "key.pem")
+	generateSelfSignedCert(t, certPath, keyPath)
+	tlsCertPath, tlsCertKeyPath = &certPath, &keyPath
+	minVersion := "VersionTLS12"
+	cipherSuites := "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"
+	tlsMinVersion, tlsCipherSuites = &minVersion, &cipherSuites
+
+	if _, err := initCerts(); err == nil || !strings.Contains(err.Error(), "API server TLS certificate key type ECDSA") {
+		t.Fatalf("initCerts() error = %v, want API certificate cipher-suite incompatibility", err)
+	}
+}
+
+func TestStartWebhookRejectsCipherSuiteIncompatibleWithWebhookCertificate(t *testing.T) {
+	origWebhookCert, origWebhookKey := webhookTLSCertPath, webhookTLSKeyPath
+	origCert, origKey := tlsCertPath, tlsCertKeyPath
+	origMin, origCiphers := tlsMinVersion, tlsCipherSuites
+	t.Cleanup(func() {
+		webhookTLSCertPath, webhookTLSKeyPath = origWebhookCert, origWebhookKey
+		tlsCertPath, tlsCertKeyPath = origCert, origKey
+		tlsMinVersion, tlsCipherSuites = origMin, origCiphers
+	})
+
+	tempDir := t.TempDir()
+	certPath, keyPath := filepath.Join(tempDir, "cert.pem"), filepath.Join(tempDir, "key.pem")
+	generateSelfSignedCert(t, certPath, keyPath)
+	webhookTLSCertPath, webhookTLSKeyPath = &certPath, &keyPath
+	empty := ""
+	tlsCertPath, tlsCertKeyPath = &empty, &empty
+	minVersion := "VersionTLS12"
+	cipherSuites := "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"
+	tlsMinVersion, tlsCipherSuites = &minVersion, &cipherSuites
+
+	server, err := startWebhook(nil, nil, &sync.WaitGroup{})
+	if err == nil || !strings.Contains(err.Error(), "webhook TLS certificate key type ECDSA") {
+		t.Fatalf("startWebhook() error = %v, want webhook certificate cipher-suite incompatibility", err)
+	}
+	if server != nil {
+		t.Fatalf("startWebhook() server = %v, want nil on incompatible certificate", server)
 	}
 }

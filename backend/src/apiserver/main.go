@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -121,12 +122,12 @@ func parseTLSCipherSuites(commaSeparated string) ([]uint16, error) {
 	if commaSeparated == "" {
 		return nil, nil
 	}
-	allCiphers := make(map[string]uint16)
+	allCiphers := make(map[string]*tls.CipherSuite)
 	for _, cs := range tls.CipherSuites() {
-		allCiphers[cs.Name] = cs.ID
+		allCiphers[cs.Name] = cs
 	}
 	for _, cs := range tls.InsecureCipherSuites() {
-		allCiphers[cs.Name] = cs.ID
+		allCiphers[cs.Name] = cs
 	}
 	var ids []uint16
 	var unknown []string
@@ -135,8 +136,21 @@ func parseTLSCipherSuites(commaSeparated string) ([]uint16, error) {
 		if name == "" {
 			continue
 		}
-		if id, ok := allCiphers[name]; ok {
-			ids = append(ids, id)
+		if cipherSuite, ok := allCiphers[name]; ok {
+			if isRC4CipherSuite(*cipherSuite) {
+				return nil, fmt.Errorf("RC4 cipher suite %q is not allowed", name)
+			}
+			supportsTLS12 := false
+			for _, version := range cipherSuite.SupportedVersions {
+				if version == tls.VersionTLS12 {
+					supportsTLS12 = true
+					break
+				}
+			}
+			if !supportsTLS12 {
+				return nil, fmt.Errorf("TLS 1.3-only cipher suite %q cannot be configured with --tlsCipherSuites", name)
+			}
+			ids = append(ids, cipherSuite.ID)
 		} else {
 			unknown = append(unknown, name)
 		}
@@ -148,6 +162,70 @@ func parseTLSCipherSuites(commaSeparated string) ([]uint16, error) {
 		return nil, fmt.Errorf("--tlsCipherSuites was set but no cipher suites were specified")
 	}
 	return ids, nil
+}
+
+func isRC4CipherSuite(cipherSuite tls.CipherSuite) bool {
+	switch cipherSuite.ID {
+	case tls.TLS_RSA_WITH_RC4_128_SHA,
+		tls.TLS_ECDHE_ECDSA_WITH_RC4_128_SHA,
+		tls.TLS_ECDHE_RSA_WITH_RC4_128_SHA:
+		return true
+	default:
+		return strings.Contains(cipherSuite.Name, "_RC4_")
+	}
+}
+
+func validateTLSConfigCertificate(tlsConfig *tls.Config, cert tls.Certificate, listener string) error {
+	if tlsConfig == nil || len(tlsConfig.CipherSuites) == 0 {
+		return nil
+	}
+	leaf := cert.Leaf
+	if leaf == nil && len(cert.Certificate) > 0 {
+		var err error
+		leaf, err = x509.ParseCertificate(cert.Certificate[0])
+		if err != nil {
+			return fmt.Errorf("failed to parse %s TLS certificate: %w", listener, err)
+		}
+	}
+	if leaf == nil {
+		return fmt.Errorf("%s TLS certificate has no leaf certificate", listener)
+	}
+
+	var requiredSuite uint16
+	switch leaf.PublicKeyAlgorithm {
+	case x509.RSA:
+		requiredSuite = tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+	case x509.ECDSA:
+		requiredSuite = tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
+	default:
+		return fmt.Errorf("--tlsCipherSuites is incompatible with %s TLS certificate key type %s", listener, leaf.PublicKeyAlgorithm)
+	}
+	for _, cipherSuite := range tlsConfig.CipherSuites {
+		if cipherSuite == requiredSuite {
+			return nil
+		}
+	}
+	return fmt.Errorf("--tlsCipherSuites is incompatible with %s TLS certificate key type %s: include %s", listener, leaf.PublicKeyAlgorithm, tlsCipherSuiteName(requiredSuite))
+}
+
+func tlsCipherSuiteName(id uint16) string {
+	for _, cipherSuite := range tls.CipherSuites() {
+		if cipherSuite.ID == id {
+			return cipherSuite.Name
+		}
+	}
+	return fmt.Sprintf("cipher suite 0x%04x", id)
+}
+
+func loadAndValidateTLSCertificate(tlsConfig *tls.Config, certPath, keyPath, listener string) (tls.Certificate, error) {
+	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
+	if err != nil {
+		return tls.Certificate{}, fmt.Errorf("failed to load %s TLS certificate: %w", listener, err)
+	}
+	if err := validateTLSConfigCertificate(tlsConfig, cert, listener); err != nil {
+		return tls.Certificate{}, err
+	}
+	return cert, nil
 }
 
 func buildTLSConfig() (*tls.Config, error) {
@@ -203,13 +281,13 @@ func initCerts() (*tls.Config, error) {
 		return nil, fmt.Errorf("missing tlsCertKeyPath when specifying cert paths, both tlsCertPath and tlsCertKeyPath are required")
 	}
 
-	serverCert, err := tls.LoadX509KeyPair(*tlsCertPath, *tlsCertKeyPath)
-	if err != nil {
-		return nil, err
-	}
 	tlsCfg, err := buildTLSConfig()
 	if err != nil {
 		return nil, fmt.Errorf("failed to build TLS config: %v", err)
+	}
+	serverCert, err := loadAndValidateTLSCertificate(tlsCfg, *tlsCertPath, *tlsCertKeyPath, "API server")
+	if err != nil {
+		return nil, err
 	}
 	tlsCfg.ServerName = common.GetMLPipelineServiceName() + "." + common.GetPodNamespace() + ".svc." + common.GetClusterDomain()
 	tlsCfg.Certificates = []tls.Certificate{serverCert}
@@ -644,6 +722,21 @@ func startWebhook(client ctrlclient.Client, clientNoCahe ctrlclient.Client, wg *
 	if err != nil {
 		return nil, fmt.Errorf("failed to build TLS config: %v", err)
 	}
+	certPath, keyPath, useTLS, err := resolveWebhookTLSPaths(
+		*webhookTLSCertPath, *webhookTLSKeyPath,
+		*tlsCertPath, *tlsCertKeyPath,
+		common.FileExists,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve webhook TLS paths: %w", err)
+	}
+	if useTLS {
+		webhookCert, err := loadAndValidateTLSCertificate(tlsConfig, certPath, keyPath, "webhook")
+		if err != nil {
+			return nil, err
+		}
+		tlsConfig.Certificates = []tls.Certificate{webhookCert}
+	}
 
 	webhookServer := &http.Server{
 		Addr:      *webhookPortFlag,
@@ -653,16 +746,6 @@ func startWebhook(client ctrlclient.Client, clientNoCahe ctrlclient.Client, wg *
 
 	go func() {
 		defer wg.Done()
-		certPath, keyPath, useTLS, resolveErr := resolveWebhookTLSPaths(
-			*webhookTLSCertPath, *webhookTLSKeyPath,
-			*tlsCertPath, *tlsCertKeyPath,
-			common.FileExists,
-		)
-		if resolveErr != nil {
-			glog.Fatalf("Failed to resolve webhook TLS paths: %v", resolveErr)
-			return
-		}
-
 		if !useTLS {
 			glog.Warning("TLS certificate/key paths are not set. Starting webhook server without TLS.")
 			err = webhookServer.ListenAndServe()
@@ -673,7 +756,7 @@ func startWebhook(client ctrlclient.Client, clientNoCahe ctrlclient.Client, wg *
 		}
 
 		glog.Info("Starting the Kubernetes webhook with TLS")
-		err := webhookServer.ListenAndServeTLS(certPath, keyPath)
+		err := webhookServer.ListenAndServeTLS("", "")
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			glog.Fatalf("Failed to start the Kubernetes webhook with TLS: %v", err)
 		}
